@@ -1,0 +1,764 @@
+﻿//+------------------------------------------------------------------+
+//|                                     BTCJPY_Hybrid_Pro_V4_3.mq5   |
+//|      Structural Supply/Demand + MyEA Full Suite                  |
+//|      V4.3: Perfect UI Alignment + Weekly Stats + Safety Buffer   |
+//+------------------------------------------------------------------+
+#property copyright "DEN Trading - BTCJPY Hybrid Edition"
+#property version   "4.30"
+#property strict
+
+#include <Trade\Trade.mqh>
+
+//--- Input Parameters
+
+input group "=== Dashboard Flag / Magic Number/Crossover/Trend Settings ==="
+input long     MagicNumber = 987112;
+input int      SlowMAPeriod    = 579;
+input bool     ShowDashboard = true;
+input bool     ShowFullDashboard = false;    // Show Main EA Stats
+input bool     ShowMonthlySummaryOnly = true; // Show ONLY 12-Month Grid        
+
+input group "=== RSI Filter ==="
+input bool     UseRSIFilter    = true;
+input int      RSIPeriod       = 105;
+input double   RSIOverbought   = 58.5;
+input double   RSIOversold     = 7.5;
+
+input group "=== Spread Filter ==="
+input bool     UseSpreadFilter = false; // Enable/Disable Spread Check
+input int      MaxSpread       = 15000;  // Maximum allowed spread in points
+
+input group "=== Risk Management ==="
+input double   FixedLotSize     = 0.01;         
+input double   StopLossPercent  = 3.48;        
+input double   TakeProfitPercent = 8.0;
+
+input group "=== Trailing & Break-even ==="
+input bool     UseTrailing           = true;
+input bool     UseIntelligentTrail   = true;
+input double   TrailingStopPct       = 1.5;   
+input bool     UseBreakEven          = false;
+input double   BE_TriggerPct         = 2.0;   
+input double   BE_BufferPct          = 0.2;   
+
+input group "=== Partial Take Profit Settings ==="
+input bool     UsePartialTP          = false;   // Enable Partial Profit Taking
+input double   PartialTP_TriggerPct  = 5.0;    // Take profit at 5% gain
+input double   PartialClosePct       = 50.0;   // Close 50% of the lot size
+
+input group "=== Equity Protection (The MyEA Suite) ==="
+input double   MinimumEquityStop     = 0.0; 
+input double   ActivationEquityGain  = 2000000.0; 
+input double   TrailingEquityPercent = 33.0;    
+
+input group "=== Structural Entry (Decay & Confirm) ==="
+input ENUM_TIMEFRAMES ZoneTF        = PERIOD_H4;
+input int      BodyStrengthMin      = 60;       
+input int      ZoneExpiryHours      = 24;       
+input double   ConfirmBodyMinPct    = 50.0;     
+
+//--- Global Variables
+CTrade      trade;
+string      prefix = "DEN_Hybrid_";  
+int         slowMA_handle, rsi_handle;
+double      startingEquity = 0, peakEquity = 0;
+bool        equityTrailingActive = false, protectionHalt = false;
+datetime    g_lastCloseTime = 0; // Stores the time of the last closed position
+double      g_monthlyProfits[12]; // Stores profits for Jan-Dec
+int         g_lastLossDirection = 0; // 0 = None, 1 = Long, -1 = Short
+
+//--- Stats tracking
+int tradesWon=0, tradesLost=0, tradesBreakEven=0, tradeCount=0;
+double totalProfit=0, weekProfit=0, monthProfit=0, yearProfit=0;
+
+struct SZone { 
+   double priceHigh, priceLow; 
+   bool isValid; 
+   datetime createdTime;   
+};
+SZone g_demandZones[1], g_supplyZones[1];
+
+string g_proxText = "Scanning...";
+color  g_proxColor = clrWhite;
+
+//+------------------------------------------------------------------+
+//| Initialization                                                   |
+//+------------------------------------------------------------------+
+int OnInit() {
+   // Chart & Tester Cleanliness
+   ChartSetInteger(0, CHART_SHOW_GRID, false);
+   TesterHideIndicators(true);
+   
+   slowMA_handle = iMA(_Symbol, PERIOD_CURRENT, SlowMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   rsi_handle    = iRSI(_Symbol, PERIOD_CURRENT, RSIPeriod, PRICE_CLOSE);
+   
+   if(slowMA_handle == INVALID_HANDLE || rsi_handle == INVALID_HANDLE) return INIT_FAILED;
+   
+   trade.SetExpertMagicNumber(MagicNumber);
+   startingEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   peakEquity     = startingEquity;
+   
+   EventSetTimer(1);
+   RefreshStats(); 
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Deinitialization function - Cleans up chart objects              |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+   ObjectsDeleteAll(0, prefix);
+   // ADD THESE:
+   IndicatorRelease(slowMA_handle);
+   IndicatorRelease(rsi_handle);
+   ChartRedraw(0);
+   Print("MyEA: Cleanup complete. Reason code: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Main Logic Flow                                                  |
+//+------------------------------------------------------------------+
+void OnTick() {
+   // 1. Critical Halt Check
+   // Stops all logic if the Equity Protection safety floor is hit.
+   if(protectionHalt) return;
+   
+   // 2. Active Trade Management (Trailing, Break-Even, & Partial TP)
+   if(PositionsTotal() > 0) {
+      
+      // --- Toggle Logic for Trailing ---
+      // If UseIntelligentTrail is true, we use the H4 Structural logic.
+      if(UseIntelligentTrail) {
+         ManageStructuralTrailing(); 
+      }
+      
+      // --- Partial Profit Taking ---
+      // Check if we should close a percentage of the position to bank gains.
+      ManagePartialTakeProfit();
+      
+      // --- Break-Even & Original Trail ---
+      // ManageActiveTrades handles Break-Even (Always) 
+      // and Original Trailing (Only if UseIntelligentTrail is false).
+      ManageActiveTrades();
+   }
+   
+   // 3. Logic & Analysis Cycle
+   // Core EA operations for zone detection and signal entry.
+   UpdateEquityProtection();  // Monitor trailing equity and hard floors.
+   DetectZones();             // Scan for new Supply/Demand zones.
+   CheckZoneExpiry();         // Remove zones older than the expiry window.
+   CalculateProximity();      // Update dashboard distance-to-zone stats.
+   CheckSignals();            // Evaluate entries based on RSI, EMA, and Zones.
+   DrawZones();               // Update visual rectangles on the chart.
+}
+
+//+------------------------------------------------------------------+
+//| Timer Function                                                   |
+//+------------------------------------------------------------------+
+void OnTimer() { 
+   UpdateMyEADashboard(); 
+}
+
+//+------------------------------------------------------------------+
+//| Refresh Stats & Global Cooldown Tracking                         |
+//+------------------------------------------------------------------+
+void RefreshStats() {
+   // 1. Select full history to calculate statistics
+   if(!HistorySelect(0, TimeCurrent())) return;
+   
+   // 2. Reset accumulators
+   tradesWon = 0; 
+   tradesLost = 0; 
+   tradesBreakEven = 0; 
+   tradeCount = 0;
+   totalProfit = 0; 
+   weekProfit = 0; 
+   monthProfit = 0; 
+   yearProfit = 0;
+   
+   // Reset the 12-month array (0.0 for all months)
+   ArrayFill(g_monthlyProfits, 0, 12, 0.0);
+   
+   // Reset global variables before the history loop
+   g_lastCloseTime = 0; 
+   g_lastLossDirection = 0; // NEW: Reset the directional filter memory
+   
+   datetime now = TimeCurrent();
+   MqlDateTime dt; TimeToStruct(now, dt);
+   
+   int totalDeals = HistoryDealsTotal();
+   
+   // 3. Loop through history deals
+   for(int i = 0; i < totalDeals; i++) {
+      ulong ticket = HistoryDealGetTicket(i);
+      
+      // Filter by Magic Number
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != MagicNumber) continue;
+      
+      // Only look at 'OUT' deals (closing a position)
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+      
+      // Calculate Net Profit (including Commission and Swap)
+      double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT) + 
+                     HistoryDealGetDouble(ticket, DEAL_COMMISSION) + 
+                     HistoryDealGetDouble(ticket, DEAL_SWAP);
+                     
+      datetime dealTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      MqlDateTime ddt; TimeToStruct(dealTime, ddt);
+      
+      // Update global last close time (the newest deal will be the final value)
+      if(dealTime > g_lastCloseTime) g_lastCloseTime = dealTime;
+      
+      // Increment Counters
+      tradeCount++;
+      totalProfit += profit;
+      
+      // Win/Loss/BE Classification (¥1.0 threshold)
+      if(profit > 1.0) tradesWon++;
+      else if(profit < -1.0) {
+         tradesLost++;
+         
+         // NEW: Directional Flip Logic
+         // If this is the absolute latest deal, record its direction as a loss
+         // If a SELL out-deal closed the trade, the position was a BUY (Long)
+         if(dealTime == g_lastCloseTime) {
+            g_lastLossDirection = (HistoryDealGetInteger(ticket, DEAL_TYPE) == DEAL_TYPE_SELL) ? 1 : -1;
+         }
+      }
+      else tradesBreakEven++;
+      
+      // 4. Periodic & Monthly Profit Logic
+      if(ddt.year == dt.year) {
+         yearProfit += profit;
+         
+         // Fill the 12-month array (Months are 1-12, Array is 0-11)
+         if(ddt.mon >= 1 && ddt.mon <= 12) {
+            g_monthlyProfits[ddt.mon - 1] += profit;
+         }
+         
+         // Current Month Check
+         if(ddt.mon == dt.mon) {
+            monthProfit += profit;
+         }
+         
+         // Week Check (within last 7 days)
+         if(now - dealTime < 604800) {
+            weekProfit += profit;
+         }
+      }
+   }
+   
+   // Safety Print to Log
+   if(tradeCount > 0) {
+      Print(StringFormat("MyEA Stats Refreshed: Total Profit ¥%.2f | Year %d: ¥%.2f", totalProfit, dt.year, yearProfit));
+      if(g_lastLossDirection != 0) {
+         Print("MyEA Directional Filter: Waiting for reversal due to recent loss.");
+      }
+   }
+}
+//+------------------------------------------------------------------+
+//| Proximity Logic                                                  |
+//+------------------------------------------------------------------+
+void CalculateProximity() {
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID), ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double ema[], rsi[];
+   CopyBuffer(slowMA_handle, 0, 0, 1, ema); CopyBuffer(rsi_handle, 0, 0, 1, rsi);
+
+   g_proxText = "Scanning..."; g_proxColor = clrGray;
+
+   if(g_demandZones[0].isValid) {
+      double dist = bid - g_demandZones[0].priceHigh;
+      double score = 100 - MathMin(100, MathMax(0, (dist/(bid*0.005))*100));
+      g_proxText = DoubleToString(score, 1) + "% ▲ (Long)"; 
+      g_proxColor = clrLime;
+   }
+   if(g_supplyZones[0].isValid) {
+      double dist = g_supplyZones[0].priceLow - ask;
+      double score = 100 - MathMin(100, MathMax(0, (dist/(ask*0.005))*100));
+      g_proxText = DoubleToString(score, 1) + "% ▼ (Short)"; 
+      g_proxColor = clrRed;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Dashboard Drawing (Optimized for Warp-Speed Backtesting)         |
+//+------------------------------------------------------------------+
+void UpdateMyEADashboard() {
+   
+   // --- PERFORMANCE GATE: SKIP UNNECESSARY REDRAWS ---
+   static datetime lastTime = 0;
+   static int lastHistoryCount = -1;
+   
+   // Logic: If showing ONLY monthly summary, only update when a trade closes.
+   if(!ShowFullDashboard && ShowMonthlySummaryOnly) {
+      if(!HistorySelect(0, TimeCurrent())) return;
+      int currentHistoryCount = HistoryDealsTotal();
+      if(currentHistoryCount == lastHistoryCount) return; // Skip redraw
+      lastHistoryCount = currentHistoryCount;
+   } 
+   // Logic: If showing Full Dashboard, limit redraw to once per second.
+   else {
+      if(TimeCurrent() == lastTime) return; // Skip redraw
+      lastTime = TimeCurrent();
+   }
+
+   // 1. Master Cleanup Logic
+   if(!ShowDashboard || (!ShowFullDashboard && !ShowMonthlySummaryOnly)) {
+      for(int i=ObjectsTotal(0, 0, OBJ_LABEL)-1; i>=0; i--) {
+         string name = ObjectName(0, i, 0, OBJ_LABEL);
+         if(StringFind(name, prefix) >= 0) ObjectDelete(0, name);
+      }
+      return; 
+   }
+
+   // 2. Selective Cleanup
+   if(!ShowFullDashboard) {
+      for(int i=ObjectsTotal(0, 0, OBJ_LABEL)-1; i>=0; i--) {
+         string name = ObjectName(0, i, 0, OBJ_LABEL);
+         if(StringFind(name, prefix) >= 0 && 
+           (StringFind(name, "_L") >= 0 || StringFind(name, "_T") >= 0 || StringFind(name, "_H") >= 0)) {
+            ObjectDelete(0, name);
+         }
+      }
+   }
+   
+   if(!ShowMonthlySummaryOnly) {
+      for(int i=ObjectsTotal(0, 0, OBJ_LABEL)-1; i>=0; i--) {
+         string name = ObjectName(0, i, 0, OBJ_LABEL);
+         if(StringFind(name, prefix) >= 0 && StringFind(name, "_M") >= 0) {
+            ObjectDelete(0, name);
+         }
+      }
+   }
+
+   // 3. Shared Variables
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double floatingPL = currentEquity - AccountInfoDouble(ACCOUNT_BALANCE);
+   string monthNames[] = {"","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   
+   int xOffset = 280; 
+   int yStart = 30;
+   int spacing = 18; 
+
+   // --- SECTION A: FULL DASHBOARD DRAWING ---
+   if(ShowFullDashboard) {
+      // Section 1: Core Status
+      CreateLabel("T1", "DEN BTCJPY Bot (% Stops)", xOffset, yStart, 10, clrGold);
+      CreateLabel("L1", (PositionsTotal() > 0) ? "├─ Position Active" : "├─ Monitoring Market...", xOffset, yStart+spacing, 9, (PositionsTotal()>0 ? clrAqua : clrLime));
+      CreateLabel("L2", "├─ Signal Proximity: " + g_proxText, xOffset, yStart+spacing*2, 9, g_proxColor);
+      CreateLabel("L3", StringFormat("├─ BTC: ¥%.0f", SymbolInfoDouble(_Symbol, SYMBOL_BID)), xOffset, yStart+spacing*3, 9, clrGold);
+      CreateLabel("L4", StringFormat("├─ Equity: ¥%.0f (¥%.0f)", currentEquity, floatingPL), xOffset, yStart+spacing*4, 9, (floatingPL >= 0 ? clrLime : clrRed));
+      
+      // Section 2: Trade Stats
+      int yStats = yStart + spacing*6;
+      CreateLabel("L5", StringFormat("├─ SL: %.1f%% | TP: %.1f%%", StopLossPercent, TakeProfitPercent), xOffset, yStats, 8, clrDeepSkyBlue);
+      CreateLabel("L6", StringFormat("├─ Trades: %d", tradeCount), xOffset, yStats+spacing, 9, clrWhite);
+      double winRate = (tradeCount > 0) ? (tradesWon * 100.0 / tradeCount) : 0;
+      CreateLabel("L7", StringFormat("├─ W: %d | BE: %d | L: %d (%.1f%%)", tradesWon, tradesBreakEven, tradesLost, winRate), xOffset, yStats+spacing*2, 9, clrLime);
+      CreateLabel("L8", StringFormat("└─ Total: ¥%.0f", totalProfit), xOffset, yStats+spacing*3, 9, (totalProfit >= 0 ? clrLime : clrRed));
+      
+      // Section 3: Period Profits
+      int yPeriod = yStats + spacing*5;
+      CreateLabel("H1", "┌ Period Profits:", xOffset, yPeriod, 8, clrGray);
+      CreateLabel("L9", StringFormat("├─ Week: ¥%.0f", weekProfit), xOffset, yPeriod+spacing, 9, clrWhite);
+      CreateLabel("L10", StringFormat("├─ %s: ¥%.0f", monthNames[dt.mon], monthProfit), xOffset, yPeriod+spacing*2, 9, clrWhite);
+      CreateLabel("L11", StringFormat("└─ %d: ¥%.0f", dt.year, yearProfit), xOffset, yPeriod+spacing*3, 9, clrWhite);
+
+      // Section 4: Equity Protection & Active Floor
+      int ySafe = yPeriod + spacing*5;
+      CreateLabel("H2", "┌ Equity Protection:", xOffset, ySafe, 8, clrGray);
+      
+      double trailingLimit = peakEquity * (1 - TrailingEquityPercent/100);
+      double realFloor = (equityTrailingActive && trailingLimit > MinimumEquityStop) ? trailingLimit : MinimumEquityStop;
+      double floorDist = currentEquity - realFloor;
+
+      CreateLabel("L12", StringFormat("├─ Hard Floor: ¥%.0f", MinimumEquityStop), xOffset, ySafe+spacing, 9, clrWhite);
+      CreateLabel("L12b", StringFormat("├─ Active Floor: ¥%.0f (Dist: ¥%.0f)", realFloor, floorDist), xOffset, ySafe+spacing*2, 9, clrCyan);
+      
+      string trailStatus = equityTrailingActive ? "Active" : StringFormat("Need ¥%.0f more", (startingEquity + ActivationEquityGain) - currentEquity);
+      CreateLabel("L13", "├─ Trailing: " + trailStatus, xOffset, ySafe+spacing*3, 9, clrOrange);
+      
+      string tradeStatus = protectionHalt ? "HALTED" : "Allowed";
+      CreateLabel("L14", "└─ Trading: " + tradeStatus, xOffset, ySafe+spacing*4, 9, (protectionHalt ? clrRed : clrLime));
+   }
+
+   // --- SECTION B: MONTHLY SUMMARY DRAWING ---
+   if(ShowMonthlySummaryOnly) {
+      // Dynamic Position: Jump to top if full dash is hidden
+      int yMonthly = ShowFullDashboard ? (yStart + spacing * 22) : yStart; 
+      
+      CreateLabel("H3", StringFormat("┌ %d Monthly Summary:", dt.year), xOffset, yMonthly, 8, clrGray);
+      
+      string mShortNames[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+      for(int m=0; m<12; m++) {
+         int colOffset = (m < 6) ? 0 : 125; 
+         int rowOffset = (m < 6) ? m : m - 6;
+         
+         color mColor = clrWhite;
+         if(g_monthlyProfits[m] > 0.1) mColor = clrLime;
+         else if(g_monthlyProfits[m] < -0.1) mColor = clrRed;
+         
+         string mText = StringFormat("%s: ¥%.0f", mShortNames[m], g_monthlyProfits[m]);
+         CreateLabel("_M"+IntegerToString(m), mText, xOffset - colOffset, yMonthly + spacing + (rowOffset * 15), 8, mColor);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Structural Logic Functions                                       |
+//+------------------------------------------------------------------+
+void CheckSignals() {
+   // 1. Basic Status Checks
+   // Stop if a position is already open or the account is halted
+   if(PositionsTotal() > 0 || protectionHalt) return;
+
+   // 2. Bar-Based Cooldown Filter
+   // Prevents re-entry on the same candle where a trade just closed
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(g_lastCloseTime >= currentBarTime) {
+      g_proxText = "Cooldown: Waiting for New Bar";
+      g_proxColor = clrYellow;
+      return; 
+   }
+
+   // 3. Directional Flip Filter (Memory Logic)
+   // Logic: If we lost on a Long, we only allow Shorts until a successful reversal entry
+   bool allowLong  = (g_lastLossDirection != 1);
+   bool allowShort = (g_lastLossDirection != -1);
+
+   // Update Dashboard to show the directional restriction
+   if(!allowLong)  { g_proxText = "Filter: Waiting for SHORT Setup"; g_proxColor = clrOrange; }
+   if(!allowShort) { g_proxText = "Filter: Waiting for LONG Setup";  g_proxColor = clrOrange; }
+
+   // 4. Spread/Execution Sanity Filter
+   if(UseSpreadFilter) {
+      int currentSpread = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+      if(currentSpread > MaxSpread) {
+         g_proxText = StringFormat("Spread High: %d", currentSpread);
+         g_proxColor = clrOrange;
+         return; 
+      }
+   }
+
+   // 5. Data Collection
+   MqlRates r[]; ArraySetAsSeries(r, true);
+   if(CopyRates(_Symbol, PERIOD_CURRENT, 0, 2, r) < 2) return;
+   
+   double b = MathAbs(r[1].close - r[1].open);
+   double rg = r[1].high - r[1].low;
+   double pct = (rg > 0) ? (b / rg) * 100 : 0; // Body strength percentage
+   
+   double rsi[], ema[]; 
+   CopyBuffer(rsi_handle, 0, 0, 1, rsi); 
+   CopyBuffer(slowMA_handle, 0, 0, 1, ema);
+   
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   // 6. Demand Zone Entry Logic (Long)
+   // Added 'allowLong' to ensure we don't repeat a failed direction
+   if(allowLong && g_demandZones[0].isValid && bid <= g_demandZones[0].priceHigh && bid >= g_demandZones[0].priceLow) {
+      // Requirements: Above EMA + RSI not Overbought + Bullish Confirmation
+      if(bid > ema[0] && rsi[0] < RSIOverbought && r[1].close > r[1].open && pct >= ConfirmBodyMinPct) {
+         if(trade.Buy(FixedLotSize, _Symbol, ask, ask * (1 - StopLossPercent / 100), ask * (1 + TakeProfitPercent / 100))) { 
+            g_demandZones[0].isValid = false; 
+            g_lastLossDirection = 0; // Reset filter once a new trade is successfully placed
+            RefreshStats(); 
+         }
+      }
+   }
+
+   // 7. Supply Zone Entry Logic (Short)
+   // Added 'allowShort' to ensure we don't repeat a failed direction
+   if(allowShort && g_supplyZones[0].isValid && ask >= g_supplyZones[0].priceLow && ask <= g_supplyZones[0].priceHigh) {
+      // Requirements: Below EMA + RSI not Oversold + Bearish Confirmation
+      if(ask < ema[0] && rsi[0] > RSIOversold && r[1].close < r[1].open && pct >= ConfirmBodyMinPct) {
+         if(trade.Sell(FixedLotSize, _Symbol, bid, bid * (1 + StopLossPercent / 100), bid * (1 - TakeProfitPercent / 100))) { 
+            g_supplyZones[0].isValid = false; 
+            g_lastLossDirection = 0; // Reset filter once a new trade is successfully placed
+            RefreshStats(); 
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Accelerated Structural Trailing Logic (Dynamic H4 Structure)     |
+//+------------------------------------------------------------------+
+void ManageStructuralTrailing() {
+   // Respect the global trailing toggle and the Intelligent toggle flag
+   if(!UseTrailing || !UseIntelligentTrail) return; 
+
+   // Explicitly define the Structural Timeframe (H4)
+   ENUM_TIMEFRAMES srTF = PERIOD_H4; 
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+      double ent = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl  = PositionGetDouble(POSITION_SL);
+      long type  = PositionGetInteger(POSITION_TYPE);
+      double prc = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      
+      // 1. Calculate current profit percentage to determine trail "tightness"
+      double pPct = MathAbs(prc - ent) / ent * 100.0;
+
+      // 2. Dynamic Lookback Logic: Higher profit = Tighter structural tracking
+      // Default: 20 bars (80 hours) for initial protection
+      int lookback = 20; 
+      
+      // Tier 1: Tighten to 10 bars (40 hours) once profit exceeds 3%
+      if(pPct > 3.0) lookback = 10; 
+      
+      // Tier 2: Aggressive tightening to 5 bars (20 hours) once profit exceeds 7%
+      if(pPct > 7.0) lookback = 5; 
+
+      if(type == POSITION_TYPE_BUY) {
+         // Find the lowest point of the dynamic H4 lookback period
+         int lowestBar = iLowest(_Symbol, srTF, MODE_LOW, lookback, 1);
+         double supportLevel = iLow(_Symbol, srTF, lowestBar);
+         
+         // Set SL 500 points below structural support with normalization
+         double finalSL = NormalizeDouble(supportLevel - (500 * _Point), _Digits);
+         
+         // Only move the Stop Loss UP to lock in gains
+         if(finalSL > sl || sl == 0) {
+            trade.PositionModify(ticket, finalSL, PositionGetDouble(POSITION_TP));
+         }
+      }
+      else if(type == POSITION_TYPE_SELL) {
+         // Find the highest point of the dynamic H4 lookback period
+         int highestBar = iHighest(_Symbol, srTF, MODE_HIGH, lookback, 1);
+         double resistanceLevel = iHigh(_Symbol, srTF, highestBar);
+         
+         // Set SL 500 points above structural resistance
+         double finalSL = NormalizeDouble(resistanceLevel + (500 * _Point), _Digits);
+         
+         // Only move the Stop Loss DOWN to lock in gains
+         if(finalSL < sl || sl == 0) {
+            trade.PositionModify(ticket, finalSL, PositionGetDouble(POSITION_TP));
+         }
+      }
+   }
+}
+
+
+void ManagePartialTakeProfit() {
+   if(!UsePartialTP) return;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong t = PositionGetTicket(i);
+      if(PositionSelectByTicket(t) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
+         
+         double initialLot = PositionGetDouble(POSITION_VOLUME);
+         double ent = PositionGetDouble(POSITION_PRICE_OPEN);
+         long type  = PositionGetInteger(POSITION_TYPE);
+         double prc = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         
+         // Calculate current profit percentage
+         double pPct = MathAbs(prc - ent) / ent * 100.0;
+
+         // Logic: If profit > Trigger AND we haven't partially closed yet
+         // Note: We check if current lot is still the 'FixedLotSize' to ensure we only do this once
+         if(pPct >= PartialTP_TriggerPct && initialLot >= FixedLotSize) {
+            double closeLot = NormalizeDouble(initialLot * (PartialClosePct / 100.0), 2);
+            
+            if(closeLot > 0) {
+               if(trade.PositionClosePartial(t, closeLot)) {
+                  Print(StringFormat("MyEA: Partial TP Hit! Closed %.2f lots at %.2f%% profit", closeLot, pPct));
+               }
+            }
+         }
+      }
+   }
+}
+
+void DetectZones() {
+   MqlRates r[]; ArraySetAsSeries(r, true);
+   if(CopyRates(_Symbol, ZoneTF, 0, 2, r) < 2) return;
+   double b = MathAbs(r[1].close - r[1].open), rg = r[1].high - r[1].low;
+   if(rg > 0 && (b/rg)*100 >= BodyStrengthMin) {
+      if(r[1].close > r[1].open) { 
+         g_demandZones[0].priceLow = r[1].low; g_demandZones[0].priceHigh = r[1].low + (rg*0.25);
+         g_demandZones[0].isValid = true; g_demandZones[0].createdTime = TimeCurrent(); 
+      } else { 
+         g_supplyZones[0].priceLow = r[1].high - (rg*0.25); g_supplyZones[0].priceHigh = r[1].high;
+         g_supplyZones[0].isValid = true; g_supplyZones[0].createdTime = TimeCurrent(); 
+      }
+   }
+}
+
+void CheckZoneExpiry() {
+   if(g_demandZones[0].isValid && (TimeCurrent() - g_demandZones[0].createdTime > ZoneExpiryHours*3600)) g_demandZones[0].isValid = false;
+   if(g_supplyZones[0].isValid && (TimeCurrent() - g_supplyZones[0].createdTime > ZoneExpiryHours*3600)) g_supplyZones[0].isValid = false;
+}
+
+//+------------------------------------------------------------------+
+//| Management & Safety                                              |
+//+------------------------------------------------------------------+
+void UpdateEquityProtection() {
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   // Track the highest equity point for trailing protection
+   if(eq > peakEquity) peakEquity = eq;
+   
+   // Check if we have gained enough to activate trailing equity protection
+   if(!equityTrailingActive && (eq - startingEquity >= ActivationEquityGain)) {
+      equityTrailingActive = true;
+      Print(">>> MyEA: Equity Trailing Protection Activated.");
+   }
+
+   // Determine the current limit based on which protection is active
+   double trailingLimit = peakEquity * (1 - TrailingEquityPercent/100);
+   bool hardFloorHit = (eq < MinimumEquityStop);
+   bool trailingHit  = (equityTrailingActive && eq < trailingLimit);
+
+   // If either protection is triggered
+   if((hardFloorHit || trailingHit) && !protectionHalt) { 
+      
+      // Prepare detailed log message
+      string reason = hardFloorHit ? "HARD FLOOR BREACHED" : "EQUITY TRAILING SL HIT";
+      double limitUsed = hardFloorHit ? MinimumEquityStop : trailingLimit;
+      
+      string logMsg = StringFormat("!!! SAFETY HALT !!!\nReason: %s\n Actual Equity: ¥%.2f\n Protection Limit: ¥%.2f\n Peak Equity: ¥%.2f", 
+                                    reason, eq, limitUsed, peakEquity);
+      
+      // 1. Permanent record in the 'Experts' log tab
+      Print(logMsg);         
+      
+      // 2. Immediate visual popup alert with sound
+      Alert(logMsg);         
+      
+      // 3. Execution: Close everything and stop the bot
+      if(PositionsTotal() > 0) CloseAllPositions(); 
+      protectionHalt = true; 
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Trade Management: Break-Even & Original Trailing Logic           |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Trade Management: Break-Even & Original Trailing Logic           |
+//+------------------------------------------------------------------+
+void ManageActiveTrades() {
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong t = PositionGetTicket(i);
+      
+      // Ensure we only manage trades belonging to this EA's Magic Number
+      if(PositionSelectByTicket(t) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
+         
+         double ent = PositionGetDouble(POSITION_PRICE_OPEN);
+         double sl  = PositionGetDouble(POSITION_SL);
+         double tp  = PositionGetDouble(POSITION_TP);
+         long type  = PositionGetInteger(POSITION_TYPE);
+         
+         double prc = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         
+         // Calculate price distance in percentage for logic triggers
+         double pPct = MathAbs(prc - ent) / ent * 100.0;
+
+         // --- 1. Break-Even Logic (Always Active if Enabled) ---
+         // Protects capital once the trade moves to the trigger percentage (e.g., 2.0%)
+         if(UseBreakEven && pPct >= BE_TriggerPct) {
+            double be = (type == POSITION_TYPE_BUY) ? 
+                        ent * (1 + BE_BufferPct/100) : 
+                        ent * (1 - BE_BufferPct/100);
+            
+            // CRITICAL CHECK: Only move to Break-Even if it improves our current position
+            // This prevents BE logic from overriding a more profitable Structural Trail stop.
+            if((type == POSITION_TYPE_BUY && sl < be) || (type == POSITION_TYPE_SELL && (sl > be || sl == 0))) {
+               if(trade.PositionModify(t, NormalizeDouble(be, _Digits), tp)) {
+                  Print(StringFormat("MyEA: Ticket #%I64u secured at Break-Even (+%.2f%%)", t, BE_BufferPct));
+               }
+            }
+         }
+
+         // --- 2. Original Trailing Stop Logic ---
+         // This logic ONLY runs if UseIntelligentTrail is set to FALSE
+         // It uses the fixed percentage trailing stop (e.g., 1.5%)
+         if(UseTrailing && !UseIntelligentTrail) {
+            double distance = prc * (TrailingStopPct / 100.0);
+            double newSL = (type == POSITION_TYPE_BUY) ? prc - distance : prc + distance;
+            
+            // Only modify if the new Stop Loss is better than the current one
+            if((type == POSITION_TYPE_BUY && newSL > sl) || (type == POSITION_TYPE_SELL && (newSL < sl || sl == 0))) {
+               if(trade.PositionModify(t, NormalizeDouble(newSL, _Digits), tp)) {
+                  Print(StringFormat("MyEA: Ticket #%I64u following Original Trail (SL: %.2f)", t, newSL));
+               }
+            }
+         }
+      }
+   }
+}
+
+
+
+//+------------------------------------------------------------------+
+//| Visual Zone Drawing Engine - 50% Transparency Look               |
+//+------------------------------------------------------------------+
+void DrawZones() {
+   // --- 1. Draw Demand Zone (Transparent Forest Green) ---
+   string demName = prefix + "Demand_Visual";
+   if(g_demandZones[0].isValid) {
+      if(ObjectFind(0, demName) < 0) {
+         // MODIFIED: Multiplying by 4 to quadruple the visual length
+         ObjectCreate(0, demName, OBJ_RECTANGLE, 0, g_demandZones[0].createdTime, g_demandZones[0].priceHigh, TimeCurrent() + (ZoneExpiryHours * 3600 * 16), g_demandZones[0].priceLow);
+         ObjectSetInteger(0, demName, OBJPROP_COLOR, C'35,70,35');
+         ObjectSetInteger(0, demName, OBJPROP_FILL, true);
+         ObjectSetInteger(0, demName, OBJPROP_BACK, true);
+         ObjectSetInteger(0, demName, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, demName, OBJPROP_HIDDEN, true);
+      }
+   } else { 
+      ObjectDelete(0, demName);
+   }
+
+   // --- 2. Draw Supply Zone (Transparent Maroon) ---
+   string supName = prefix + "Supply_Visual";
+   if(g_supplyZones[0].isValid) {
+      if(ObjectFind(0, supName) < 0) {
+         // MODIFIED: Multiplying by 4 to quadruple the visual length
+         ObjectCreate(0, supName, OBJ_RECTANGLE, 0, g_supplyZones[0].createdTime, g_supplyZones[0].priceLow, TimeCurrent() + (ZoneExpiryHours * 3600 * 16), g_supplyZones[0].priceHigh);
+         ObjectSetInteger(0, supName, OBJPROP_COLOR, C'70,35,35');
+         ObjectSetInteger(0, supName, OBJPROP_FILL, true);
+         ObjectSetInteger(0, supName, OBJPROP_BACK, true);
+         ObjectSetInteger(0, supName, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, supName, OBJPROP_HIDDEN, true);
+      }
+   } else { 
+      ObjectDelete(0, supName);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| UI Helper (The Alignment Secret)                                 |
+//+------------------------------------------------------------------+
+void CreateLabel(string name, string text, int x, int y, int size, color clr) {
+   string obj = prefix + name;
+   if(ObjectFind(0, obj) < 0) { 
+      ObjectCreate(0, obj, OBJ_LABEL, 0, 0, 0); 
+      ObjectSetInteger(0, obj, OBJPROP_CORNER, CORNER_RIGHT_UPPER); 
+      // We set Anchor to LEFT while Corner is RIGHT. 
+      // This means all text starts at a fixed point (x) and flows to the right.
+      ObjectSetInteger(0, obj, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER); 
+   }
+   ObjectSetString(0, obj, OBJPROP_TEXT, text); 
+   ObjectSetInteger(0, obj, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, obj, OBJPROP_YDISTANCE, y); 
+   ObjectSetInteger(0, obj, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, obj, OBJPROP_FONTSIZE, size); 
+   ObjectSetString(0, obj, OBJPROP_FONT, "Lucida Console"); // Monospace for perfect tree alignment
+}
+
+void CloseAllPositions() {
+   for(int i = PositionsTotal()-1; i >= 0; i--) {
+      ulong t = PositionGetTicket(i);
+      if(PositionSelectByTicket(t) && PositionGetInteger(POSITION_MAGIC) == MagicNumber) trade.PositionClose(t);
+   }
+   RefreshStats();
+}
