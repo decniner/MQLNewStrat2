@@ -116,8 +116,8 @@ void OnDeinit(const int reason) {
 }
 
 void OnTick() {
+   ResetDailyCounters();  // Must run BEFORE protectionHalt check so daily reset works
    if(protectionHalt) return;
-   ResetDailyCounters();
    if(PositionsTotal() > 0) {
       if(UseIntelligentTrail) ManageStructuralTrailing();
       ManagePartialTakeProfit();
@@ -154,6 +154,10 @@ void ResetDailyCounters() {
    if(currentDay != g_currentDay) {
       g_currentDay = currentDay; g_tradesToday = 0; g_dailyPNL = 0;
       g_dailyStartingEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      if(protectionHalt) {
+         protectionHalt = false;  // Reset daily halt on new day
+         Print("V5.2: Daily loss limit reset - new trading day");
+      }
    }
    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    g_dailyPNL = currentEquity - g_dailyStartingEquity;
