@@ -1,10 +1,12 @@
 //+------------------------------------------------------------------+
 //|                                   BTCJPY_Hybrid_Pro_V5_2.mq5     |
 //|      V5.1 + Break of Structure (BoS) confirmation from LowDD     |
-//|      Best of both: volatile-adjusted params + structure break     |
+//|      V5.2a: Data-driven params from full-year BTCJPY analysis    |
+//|      Year range: 102.1% | Avg monthly range: 20.4% | DD: 49.3%  |
+//|      SL=6.5% (30% mo range) | TP=10% (50% mo range) | Trail=3.5% |
 //+------------------------------------------------------------------+
-#property copyright "DEN Trading - BTCJPY Hybrid Edition V5.2"
-#property version   "5.20"
+#property copyright "DEN Trading - BTCJPY Hybrid Edition V5.2a"
+#property version   "5.21"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -33,13 +35,13 @@ input int      MaxSpread       = 15000;
 
 input group "=== Risk Management ==="
 input double   FixedLotSize     = 0.01;
-input double   StopLossPercent  = 7.0;
-input double   TakeProfitPercent = 8.0;
+input double   StopLossPercent  = 6.5;    // 30% of avg monthly range (20.4%)
+input double   TakeProfitPercent = 10.0;   // 50% of avg monthly range (20.4%)
 
 input group "=== Trailing & Break-even ==="
 input bool     UseTrailing           = true;
 input bool     UseIntelligentTrail   = true;
-input double   TrailingStopPct       = 4.0;
+input double   TrailingStopPct       = 3.5;    // 15% of avg monthly range
 input bool     UseBreakEven          = true;
 input double   BE_TriggerPct         = 3.0;
 input double   BE_BufferPct          = 0.5;
@@ -51,7 +53,7 @@ input double   PartialClosePct       = 40.0;
 
 input group "=== Daily Risk Limits ==="
 input int      MaxTradesPerDay       = 2;
-input double   MaxDailyLossPercent   = 6.0;
+input double   MaxDailyLossPercent   = 5.0;    // Tighter: 49% max DD market
 input bool     UseDailyLossLimit     = true;
 
 input group "=== Equity Protection ==="
